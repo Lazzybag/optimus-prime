@@ -8,7 +8,7 @@ protocol adapters by directly querying the DefiLlama-Adapters GitHub repository.
 
 Data Source: DefiLlama-Adapters GitHub Repository (/projects directory)
 Author: Lazzybag
-Version: 2.1.0
+Version: 2.2.0
 """
 
 import os
@@ -70,6 +70,30 @@ CONTRACT_CATEGORIES = {
         'staking', 'stake', 'deposit', 'validator', 'node', 'lsp'
     ]
 }
+
+
+class DualOutput:
+    """Outputs to both console and file"""
+    def __init__(self, log_file: str):
+        self.log_file = log_file
+        self.file = open(log_file, 'w', encoding='utf-8')
+        self.console = sys.stdout
+
+    def write(self, message: str):
+        """Write to both console and file"""
+        self.console.write(message)
+        self.console.flush()
+        self.file.write(message)
+        self.file.flush()
+
+    def flush(self):
+        """Flush both outputs"""
+        self.console.flush()
+        self.file.flush()
+
+    def close(self):
+        """Close file"""
+        self.file.close()
 
 
 @dataclass
@@ -422,7 +446,7 @@ class LiquidStakingDiscoveryBot:
     def run(self, limit: Optional[int] = None):
         """Run the complete discovery and analysis process"""
         print("\n" + "="*80)
-        print("🚀 LIQUID STAKING PROTOCOL DISCOVERY BOT v2.1")
+        print("🚀 LIQUID STAKING PROTOCOL DISCOVERY BOT v2.2")
         print("="*80)
         print("Research Objective: Academic analysis of liquid staking protocols")
         print("Data Source: DefiLlama-Adapters GitHub Repository")
@@ -506,17 +530,35 @@ class LiquidStakingDiscoveryBot:
 def main():
     """Main entry point"""
     try:
+        # Create log file with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_filename = f"liquid_staking_discovery_{timestamp}.log"
+
+        # Redirect stdout to both console and file
+        dual_output = DualOutput(log_filename)
+        original_stdout = sys.stdout
+        sys.stdout = dual_output
+
         print("\n" + "="*80)
         print("DEFILLAMA LIQUID STAKING ADAPTERS FETCHER")
         print("="*80)
+        print(f"📝 Log file: {log_filename}\n")
 
         if not GITHUB_PAT:
             print("❌ Error: GITHUB_PAT not found in .env file")
             print("   Add to .env: GITHUB_PAT=your_token_here")
+            dual_output.close()
+            sys.stdout = original_stdout
             return
 
         bot = LiquidStakingDiscoveryBot()
         bot.run(limit=None)
+
+        # Close the dual output and restore stdout
+        dual_output.close()
+        sys.stdout = original_stdout
+
+        print(f"\n✅ Log file saved: {log_filename}")
 
     except ValueError as e:
         print(f"❌ Configuration Error: {str(e)}")
