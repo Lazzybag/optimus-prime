@@ -5,11 +5,10 @@ Research Tool for Analyzing Liquid Staking Protocol Architecture
 
 Objective: Extract and categorize contract addresses from liquid staking
 protocol adapters by directly querying the DefiLlama-Adapters GitHub repository.
-This approach bypasses API limitations by using GitHub API directly.
 
 Data Source: DefiLlama-Adapters GitHub Repository (/projects directory)
 Author: Lazzybag
-Version: 2.0.0
+Version: 2.1.0
 """
 
 import os
@@ -33,28 +32,31 @@ GITHUB_API_BASE = "https://api.github.com"
 DEFILLLAMA_ADAPTERS_REPO = "DefiLlama/DefiLlama-Adapters"
 PROJECTS_DIR = "projects"
 
+# Headers for GitHub API authentication
+HEADERS = {
+    "Authorization": f"token {GITHUB_PAT}",
+    "Accept": "application/vnd.github.v3+json"
+}
+
 # Liquid Staking Keywords for Protocol Identification
 LIQUID_STAKING_KEYWORDS = [
-    'liquid', 'stake', 'staking', 'liquid-staking', 'lstake',
-    'lsd', 'derivative', 'eth2', 'beacon', 'consensus',
-    'wrapped', 'beacon-chain', 'restake', 'restaking'
+    'lido', 'steth', 'reth', 'rocket', 'stakewise', 'frxeth', 'frax',
+    'sfrxeth', 'eigen', 'eigenlayer', 'puffer', 'mellow', 'instadapp',
+    'symbiotic', 'karak', 'restake', 'pendle', 'aave', 'morpho',
+    'yearn', 'convex', 'stake', 'liquid', 'lsp', 'kelp', 'lst',
+    'liquid-staking', 'liquid_staking', 'lsd', 'derivative', 'eth2',
+    'beacon', 'consensus', 'wrapped', 'beacon-chain', 'restaking'
 ]
-
-# Regex patterns for contract address extraction
-ADDRESS_PATTERNS = {
-    'ethereum': r'0x[a-fA-F0-9]{40}',  # Ethereum addresses
-    'solana': r'[1-9A-HJ-NP-Z]{43,44}',  # Solana addresses
-}
 
 # Contract categorization keywords
 CONTRACT_CATEGORIES = {
     'reward': [
         'reward', 'claim', 'distribute', 'emission', 'incentive',
-        'staking_reward', 'yield', 'earning', 'apy', 'interest'
+        'staking_reward', 'yield', 'earning', 'apy', 'interest', 'fee'
     ],
     'withdrawal': [
         'withdraw', 'redeem', 'unstake', 'exit', 'claim_withdraw',
-        'burn', 'unwrap', 'exchange', 'swap', 'exit'
+        'burn', 'unwrap', 'exchange', 'swap'
     ],
     'treasury': [
         'treasury', 'admin', 'operations', 'operational', 'vault',
@@ -65,22 +67,9 @@ CONTRACT_CATEGORIES = {
         'delegate', 'snapshot', 'voting_escrow'
     ],
     'staking': [
-        'staking', 'stake', 'deposit', 'validator', 'node'
+        'staking', 'stake', 'deposit', 'validator', 'node', 'lsp'
     ]
 }
-
-
-@dataclass
-class ContractAddress:
-    """Represents an extracted contract address with metadata"""
-    address: str
-    chain: str
-    category: Optional[str] = None
-    context: Optional[str] = None
-    confidence: float = 0.5
-
-    def to_dict(self):
-        return asdict(self)
 
 
 @dataclass
@@ -96,6 +85,7 @@ class ProtocolAnalysis:
     staking_addresses: List[str]
     total_addresses: int
     adapter_url: str
+    index_file_url: str
     extraction_timestamp: str
     code_length: int
     notes: str = ""
@@ -110,10 +100,12 @@ class RateLimitTracker:
         self.remaining = 5000
         self.reset_time = None
         self.total_requests = 0
+        self.limit = 5000
 
     def update(self, headers: Dict):
         """Update rate limit info from response headers"""
         self.remaining = int(headers.get('X-RateLimit-Remaining', 5000))
+        self.limit = int(headers.get('X-RateLimit-Limit', 5000))
         self.reset_time = int(headers.get('X-RateLimit-Reset', 0))
         self.total_requests += 1
 
@@ -122,7 +114,7 @@ class RateLimitTracker:
         if self.reset_time:
             reset_dt = datetime.fromtimestamp(self.reset_time)
             print(f"\n📊 Rate Limit Status:")
-            print(f"   Remaining Requests: {self.remaining}")
+            print(f"   Remaining Requests: {self.remaining}/{self.limit}")
             print(f"   Total Requests Made: {self.total_requests}")
             print(f"   Reset Time: {reset_dt.strftime('%Y-%m-%d %H:%M:%S')}")
         else:
@@ -145,118 +137,87 @@ class LiquidStakingDiscoveryBot:
                 "❌ GITHUB_PAT environment variable not set. "
                 "Please add it to your .env file."
             )
-        self.github_token = GITHUB_PAT
-        self.session = self._create_session()
         self.rate_limiter = RateLimitTracker()
         self.protocols: List[ProtocolAnalysis] = []
-        self.discovered_protocols: Set[str] = set()
+        self._check_rate_limit()
 
-    def _create_session(self) -> requests.Session:
-        """Create a requests session with authentication"""
-        session = requests.Session()
-        session.headers.update({
-            'Authorization': f'token {self.github_token}',
-            'Accept': 'application/vnd.github.v3+json',
-            'User-Agent': 'LiquidStakingDiscoveryBot/2.0'
-        })
-        return session
-
-    def _make_request(self, url: str, timeout: int = 30) -> Optional[requests.Response]:
-        """Make HTTP request with error handling"""
+    def _check_rate_limit(self):
+        """Check initial rate limit"""
         try:
-            response = self.session.get(url, timeout=timeout)
+            url = f"{GITHUB_API_BASE}/rate_limit"
+            response = requests.get(url, headers=HEADERS)
+            if response.status_code == 200:
+                self.rate_limiter.update(response.headers)
+                print(f"📊 Initial Rate Limit: {self.rate_limiter.remaining}/{self.rate_limiter.limit}")
+        except Exception as e:
+            print(f"⚠️  Could not check rate limit: {str(e)}")
+
+    def discover_protocols(self) -> List[Dict]:
+        """Discover all protocols in /projects directory"""
+        print("\n🔍 Fetching all protocol adapters from /projects directory...")
+
+        url = f"{GITHUB_API_BASE}/repos/{DEFILLLAMA_ADAPTERS_REPO}/contents/{PROJECTS_DIR}"
+        print(f"   Requesting: {url}")
+
+        try:
+            response = requests.get(url, headers=HEADERS)
+            self.rate_limiter.update(response.headers)
+
+            if response.status_code == 404:
+                print(f"❌ 404 Error: /projects directory not found")
+                return []
+
+            if response.status_code == 401:
+                print(f"❌ 401 Error: Authentication failed - check your GITHUB_PAT")
+                return []
+
+            response.raise_for_status()
+
+            adapters = response.json()
+
+            # Filter only directories (protocols)
+            protocol_dirs = [item for item in adapters if item["type"] == "dir"]
+
+            print(f"✅ Found {len(protocol_dirs)} protocol directories")
+
+            return protocol_dirs
+
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Error fetching adapters: {e}")
+            return []
+
+    def is_liquid_staking_protocol(self, protocol_name: str) -> bool:
+        """Check if protocol name matches liquid staking keywords"""
+        name_lower = protocol_name.lower()
+        return any(keyword in name_lower for keyword in LIQUID_STAKING_KEYWORDS)
+
+    def fetch_adapter_file(self, protocol_name: str) -> Optional[Tuple[str, str, str]]:
+        """Fetch adapter file from a protocol's directory"""
+        try:
+            index_url = f"{GITHUB_API_BASE}/repos/{DEFILLLAMA_ADAPTERS_REPO}/contents/{PROJECTS_DIR}/{protocol_name}/index.js"
+
+            response = requests.get(index_url, headers=HEADERS)
             self.rate_limiter.update(response.headers)
 
             if response.status_code == 404:
                 return None
-            elif response.status_code == 403:
-                print(f"   ❌ Rate limit or access denied: {url}")
-                return None
-            elif response.status_code >= 400:
-                print(f"   ❌ HTTP {response.status_code}: {url}")
+
+            if response.status_code != 200:
                 return None
 
-            return response
-        except requests.exceptions.Timeout:
-            print(f"   ⏱️  Timeout: {url}")
+            file_data = response.json()
+
+            # Get raw content from download_url
+            raw_response = requests.get(file_data["download_url"])
+            raw_response.raise_for_status()
+            raw_content = raw_response.text
+
+            return file_data["html_url"], raw_content, file_data["download_url"]
+
+        except requests.exceptions.RequestException:
             return None
-        except requests.exceptions.RequestException as e:
-            print(f"   ❌ Request error: {str(e)}")
-            return None
 
-    def discover_protocols(self) -> List[str]:
-        """Discover all protocols in /projects directory"""
-        print("\n🔍 Discovering protocols from DefiLlama-Adapters repository...")
-        
-        url = f"{GITHUB_API_BASE}/repos/{DEFILLLAMA_ADAPTERS_REPO}/contents/{PROJECTS_DIR}"
-        response = self._make_request(url)
-        
-        if not response:
-            print("❌ Failed to fetch projects directory")
-            return []
-
-        try:
-            items = response.json()
-            protocols = [
-                item['name'] for item in items
-                if item['type'] == 'dir' and not item['name'].startswith('.')
-            ]
-            print(f"✅ Found {len(protocols)} total projects in /projects directory")
-            return sorted(protocols)
-        except (json.JSONDecodeError, KeyError) as e:
-            print(f"❌ Error parsing response: {str(e)}")
-            return []
-
-    def is_liquid_staking_protocol(self, protocol_name: str, adapter_code: str) -> bool:
-        """Determine if a protocol is liquid staking related"""
-        protocol_lower = protocol_name.lower()
-        code_lower = adapter_code.lower()
-        
-        # Check protocol name
-        for keyword in LIQUID_STAKING_KEYWORDS:
-            if keyword in protocol_lower:
-                return True
-        
-        # Check adapter code content
-        liquid_staking_indicators = [
-            'liquid staking', 'lsd', 'lst', 'beacon', 'validator',
-            'staking derivative', 'liquid stake', 'eth2', 'restaking'
-        ]
-        
-        for indicator in liquid_staking_indicators:
-            if indicator in code_lower:
-                return True
-        
-        return False
-
-    def fetch_adapter_file(self, protocol_slug: str) -> Optional[Tuple[str, str]]:
-        """Fetch adapter file from a protocol's directory"""
-        # Try different possible paths
-        possible_paths = [
-            f"{PROJECTS_DIR}/{protocol_slug}/index.js",
-            f"{PROJECTS_DIR}/{protocol_slug}/index.ts",
-            f"{PROJECTS_DIR}/{protocol_slug}/index.json",
-        ]
-
-        for path in possible_paths:
-            url = f"{GITHUB_API_BASE}/repos/{DEFILLLAMA_ADAPTERS_REPO}/contents/{path}"
-            response = self._make_request(url)
-
-            if response and response.status_code == 200:
-                try:
-                    content_data = response.json()
-                    # Handle base64 encoded content
-                    if 'content' in content_data:
-                        import base64
-                        content = base64.b64decode(content_data['content']).decode('utf-8')
-                        return path, content
-                except Exception as e:
-                    print(f"   ⚠️  Error decoding {path}: {str(e)}")
-                    continue
-
-        return None
-
-    def extract_contract_addresses(self, code: str, protocol_name: str) -> Dict[str, List[str]]:
+    def extract_contract_addresses(self, code: str) -> Dict[str, List[str]]:
         """Extract contract addresses from adapter code"""
         addresses_by_category = {
             'reward': [],
@@ -268,24 +229,27 @@ class LiquidStakingDiscoveryBot:
         }
 
         # Extract all Ethereum addresses
-        ethereum_pattern = ADDRESS_PATTERNS['ethereum']
-        matches = list(re.finditer(ethereum_pattern, code))
+        address_pattern = r'0x[a-fA-F0-9]{40}'
+        matches = list(re.finditer(address_pattern, code))
 
-        # Track unique addresses to avoid duplicates
+        # Track unique addresses
         seen_addresses = set()
+
+        # Split code into lines for context analysis
+        lines = code.split('\n')
 
         for match in matches:
             address = match.group(0)
-            
-            # Skip if we've already categorized this address
+
+            # Skip if already seen
             if address in seen_addresses:
                 continue
             seen_addresses.add(address)
 
             # Get surrounding context
-            start = max(0, match.start() - 200)
-            end = min(len(code), match.end() + 200)
-            context = code[start:end].lower()
+            start_line = max(0, match.start() - 200)
+            end_line = min(len(code), match.end() + 200)
+            context = code[start_line:end_line].lower()
 
             # Categorize address
             category = self._categorize_address(context)
@@ -303,10 +267,10 @@ class LiquidStakingDiscoveryBot:
     def extract_chains(self, adapter_code: str) -> List[str]:
         """Extract chain names from adapter code"""
         chains = set()
-        
+
         # Common chain identifiers in adapter code
         chain_patterns = {
-            'ethereum': [r'ethereum', r'eth:', r'\'ethereum\'', r'"ethereum"'],
+            'ethereum': [r'ethereum', r'eth:', r'\'ethereum\'', r'"ethereum"', r'0x[a-f0-9]{40}'],
             'polygon': [r'polygon', r'matic', r'\'polygon\'', r'"polygon"'],
             'arbitrum': [r'arbitrum', r'arb:', r'\'arbitrum\''],
             'optimism': [r'optimism', r'op:', r'\'optimism\''],
@@ -316,68 +280,53 @@ class LiquidStakingDiscoveryBot:
             'solana': [r'solana', r'sol:', r'\'solana\''],
             'cosmos': [r'cosmos', r'atom:', r'\'cosmos\''],
         }
-        
+
         code_lower = adapter_code.lower()
         for chain, patterns in chain_patterns.items():
             for pattern in patterns:
                 if re.search(pattern, code_lower):
                     chains.add(chain)
                     break
-        
+
         return sorted(list(chains)) if chains else ['unknown']
 
-    def analyze_protocol(self, protocol_name: str) -> Optional[ProtocolAnalysis]:
+    def analyze_protocol(self, protocol_dir: Dict) -> Optional[ProtocolAnalysis]:
         """Analyze a single protocol"""
-        print(f"\n📋 Analyzing: {protocol_name}")
+        protocol_name = protocol_dir["name"]
 
         # Fetch adapter file
         adapter_result = self.fetch_adapter_file(protocol_name)
         if not adapter_result:
-            print(f"   ⚠️  No adapter file found")
             return None
 
-        adapter_path, adapter_code = adapter_result
-
-        # Check if it's a liquid staking protocol
-        if not self.is_liquid_staking_protocol(protocol_name, adapter_code):
-            print(f"   ⚠️  Not identified as liquid staking protocol")
-            return None
-
-        print(f"   ✅ Confirmed liquid staking protocol")
+        index_file_url, adapter_code, download_url = adapter_result
 
         # Extract chains
         chains = self.extract_chains(adapter_code)
 
         # Extract contracts
-        contracts = self.extract_contract_addresses(adapter_code, protocol_name)
+        contracts = self.extract_contract_addresses(adapter_code)
 
         # Build adapter URL
-        adapter_url = f"https://github.com/{DEFILLLAMA_ADAPTERS_REPO}/tree/main/{adapter_path}"
+        adapter_url = f"https://github.com/{DEFILLLAMA_ADAPTERS_REPO}/tree/main/{PROJECTS_DIR}/{protocol_name}"
 
         # Create analysis
         analysis = ProtocolAnalysis(
             protocol_name=protocol_name,
             protocol_slug=protocol_name.lower(),
             chains=chains,
-            reward_addresses=contracts['reward'],
-            withdrawal_addresses=contracts['withdrawal'],
-            treasury_addresses=contracts['treasury'],
-            governance_addresses=contracts['governance'],
-            staking_addresses=contracts['staking'],
-            total_addresses=sum(len(v) for v in contracts.values()),
+            reward_addresses=list(set(contracts['reward'])),
+            withdrawal_addresses=list(set(contracts['withdrawal'])),
+            treasury_addresses=list(set(contracts['treasury'])),
+            governance_addresses=list(set(contracts['governance'])),
+            staking_addresses=list(set(contracts['staking'])),
+            total_addresses=sum(len(set(v)) for v in contracts.values()),
             adapter_url=adapter_url,
+            index_file_url=index_file_url,
             extraction_timestamp=datetime.now().isoformat(),
             code_length=len(adapter_code),
-            notes=f"Source: {adapter_path}"
+            notes=f"Source: {PROJECTS_DIR}/{protocol_name}"
         )
-
-        print(f"   📊 Found {analysis.total_addresses} contract addresses")
-        print(f"      - Reward: {len(analysis.reward_addresses)}")
-        print(f"      - Withdrawal: {len(analysis.withdrawal_addresses)}")
-        print(f"      - Treasury: {len(analysis.treasury_addresses)}")
-        print(f"      - Governance: {len(analysis.governance_addresses)}")
-        print(f"      - Staking: {len(analysis.staking_addresses)}")
-        print(f"   🌐 Chains: {', '.join(chains)}")
 
         return analysis
 
@@ -394,7 +343,7 @@ class LiquidStakingDiscoveryBot:
                     'Reward Addresses', 'Withdrawal Addresses',
                     'Treasury/Operational Addresses', 'Governance Addresses',
                     'Staking Addresses', 'Total Contract Addresses',
-                    'Code Length', 'Adapter URL', 'Extraction Timestamp'
+                    'Code Length', 'Adapter URL', 'Index File URL', 'Extraction Timestamp'
                 ]
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
@@ -412,6 +361,7 @@ class LiquidStakingDiscoveryBot:
                         'Total Contract Addresses': protocol.total_addresses,
                         'Code Length': protocol.code_length,
                         'Adapter URL': protocol.adapter_url,
+                        'Index File URL': protocol.index_file_url,
                         'Extraction Timestamp': protocol.extraction_timestamp
                     })
             print(f"✅ Results exported to {filename}")
@@ -444,15 +394,40 @@ class LiquidStakingDiscoveryBot:
         except IOError as e:
             print(f"❌ Failed to export JSON: {str(e)}")
 
+    def display_results(self):
+        """Display extracted protocol information"""
+        print("\n" + "="*80)
+        print("LIQUID STAKING PROTOCOLS - CONTRACT ADDRESSES")
+        print("="*80 + "\n")
+
+        if not self.protocols:
+            print("⚠️  No liquid staking protocols found!")
+            return
+
+        for idx, protocol in enumerate(self.protocols, 1):
+            print(f"{idx}. 📌 {protocol.protocol_name}")
+            print(f"   GitHub: {protocol.adapter_url}")
+            print(f"   Index: {protocol.index_file_url}")
+            print(f"   Total Contracts: {protocol.total_addresses}")
+
+            if protocol.staking_addresses:
+                print(f"   🔒 Staking: {', '.join(protocol.staking_addresses[:2])}")
+            if protocol.reward_addresses:
+                print(f"   💰 Rewards: {', '.join(protocol.reward_addresses[:2])}")
+            if protocol.withdrawal_addresses:
+                print(f"   🚀 Withdrawal: {', '.join(protocol.withdrawal_addresses[:2])}")
+
+            print()
+
     def run(self, limit: Optional[int] = None):
         """Run the complete discovery and analysis process"""
-        print("\n" + "="*70)
-        print("🚀 LIQUID STAKING PROTOCOL DISCOVERY BOT v2.0")
-        print("="*70)
+        print("\n" + "="*80)
+        print("🚀 LIQUID STAKING PROTOCOL DISCOVERY BOT v2.1")
+        print("="*80)
         print("Research Objective: Academic analysis of liquid staking protocols")
         print("Data Source: DefiLlama-Adapters GitHub Repository")
         print("Method: Direct GitHub API (no external subscriptions required)")
-        print("="*70)
+        print("="*80)
 
         # Discover protocols
         all_protocols = self.discover_protocols()
@@ -460,12 +435,22 @@ class LiquidStakingDiscoveryBot:
             print("❌ No protocols found. Exiting.")
             return
 
+        print(f"\n📋 Scanning {len(all_protocols)} protocols for liquid staking...")
+
+        # Filter for liquid staking protocols
+        liquid_staking_protocols = [
+            p for p in all_protocols
+            if self.is_liquid_staking_protocol(p["name"])
+        ]
+
+        print(f"✅ Found {len(liquid_staking_protocols)} liquid staking protocols")
+
         # Limit analysis if specified
         if limit:
-            protocols_to_analyze = all_protocols[:limit]
-            print(f"\n⚙️  Limiting analysis to {limit} protocols")
+            protocols_to_analyze = liquid_staking_protocols[:limit]
+            print(f"⚙️  Limiting analysis to {limit} protocols\n")
         else:
-            protocols_to_analyze = all_protocols
+            protocols_to_analyze = liquid_staking_protocols
 
         # Analyze each protocol
         analyzed = 0
@@ -476,38 +461,43 @@ class LiquidStakingDiscoveryBot:
                 print("\n⚠️  Rate limit reached. Pausing analysis.")
                 break
 
+            protocol_name = protocol["name"]
+            print(f"  [{i}/{len(protocols_to_analyze)}] 📋 {protocol_name}...", end=" ", flush=True)
+
             analysis = self.analyze_protocol(protocol)
             if analysis:
                 self.protocols.append(analysis)
+                print(f"✓ ({analysis.total_addresses} contracts)")
                 analyzed += 1
             else:
+                print("✗")
                 skipped += 1
 
             # Be respectful with API calls
-            time.sleep(0.3)
-
-            # Show progress every 10 protocols
-            if i % 10 == 0:
-                print(f"\n   Progress: {i}/{len(protocols_to_analyze)} protocols processed")
+            time.sleep(0.1)
 
         # Export results
-        print("\n" + "="*70)
+        print("\n" + "="*80)
         print("📤 EXPORTING RESULTS")
-        print("="*70)
+        print("="*80)
         self.export_to_csv()
         self.export_to_json()
 
         # Display summary
-        print("\n" + "="*70)
+        print("\n" + "="*80)
         print("📊 ANALYSIS SUMMARY")
-        print("="*70)
+        print("="*80)
         print(f"Total Protocols Discovered: {len(all_protocols)}")
+        print(f"Liquid Staking Protocols Found: {len(liquid_staking_protocols)}")
         print(f"Protocols Analyzed: {analyzed}")
-        print(f"Protocols Skipped (non-liquid-staking): {skipped}")
+        print(f"Protocols Skipped: {skipped}")
         print(f"Total Contract Addresses Found: {sum(p.total_addresses for p in self.protocols)}")
         if self.protocols:
             avg_addresses = sum(p.total_addresses for p in self.protocols) / len(self.protocols)
             print(f"Average Addresses per Protocol: {avg_addresses:.1f}")
+
+        # Display detailed results
+        self.display_results()
 
         self.rate_limiter.display()
         print("\n✅ Analysis complete!\n")
@@ -516,9 +506,18 @@ class LiquidStakingDiscoveryBot:
 def main():
     """Main entry point"""
     try:
+        print("\n" + "="*80)
+        print("DEFILLAMA LIQUID STAKING ADAPTERS FETCHER")
+        print("="*80)
+
+        if not GITHUB_PAT:
+            print("❌ Error: GITHUB_PAT not found in .env file")
+            print("   Add to .env: GITHUB_PAT=your_token_here")
+            return
+
         bot = LiquidStakingDiscoveryBot()
-        # Run analysis (set limit to a number to test, e.g., limit=10)
         bot.run(limit=None)
+
     except ValueError as e:
         print(f"❌ Configuration Error: {str(e)}")
         sys.exit(1)
